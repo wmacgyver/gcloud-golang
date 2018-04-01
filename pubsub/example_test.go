@@ -15,61 +15,355 @@
 package pubsub_test
 
 import (
-	"io/ioutil"
-	"log"
+	"fmt"
+	"time"
 
+	"cloud.google.com/go/pubsub"
 	"golang.org/x/net/context"
-	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/google"
-	"google.golang.org/cloud"
-	"google.golang.org/cloud/pubsub"
+	"google.golang.org/api/iterator"
 )
 
-func Example_auth() context.Context {
-	// Initialize an authorized context with Google Developers Console
-	// JSON key. Read the google package examples to learn more about
-	// different authorization flows you can use.
-	// http://godoc.org/golang.org/x/oauth2/google
-	jsonKey, err := ioutil.ReadFile("/path/to/json/keyfile.json")
+func ExampleNewClient() {
+	ctx := context.Background()
+	_, err := pubsub.NewClient(ctx, "project-id")
 	if err != nil {
-		log.Fatal(err)
+		// TODO: Handle error.
 	}
-	conf, err := google.JWTConfigFromJSON(
-		jsonKey,
-		pubsub.ScopeCloudPlatform,
-		pubsub.ScopePubSub,
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-	ctx := cloud.NewContext("project-id", conf.Client(oauth2.NoContext))
-	// See the other samples to learn how to use the context.
-	return ctx
+
+	// See the other examples to learn how to use the Client.
 }
 
-func ExamplePublish() {
-	ctx := Example_auth()
+func ExampleClient_CreateTopic() {
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, "project-id")
+	if err != nil {
+		// TODO: Handle error.
+	}
 
-	msgIDs, err := pubsub.Publish(ctx, "topic1", &pubsub.Message{
-		Data: []byte("hello world"),
+	// Create a new topic with the given name.
+	topic, err := client.CreateTopic(ctx, "topicName")
+	if err != nil {
+		// TODO: Handle error.
+	}
+
+	_ = topic // TODO: use the topic.
+}
+
+// Use TopicInProject to refer to a topic that is not in the client's project, such
+// as a public topic.
+func ExampleClient_TopicInProject() {
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, "project-id")
+	if err != nil {
+		// TODO: Handle error.
+	}
+	topic := client.TopicInProject("topicName", "another-project-id")
+	_ = topic // TODO: use the topic.
+}
+
+func ExampleClient_CreateSubscription() {
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, "project-id")
+	if err != nil {
+		// TODO: Handle error.
+	}
+
+	// Create a new topic with the given name.
+	topic, err := client.CreateTopic(ctx, "topicName")
+	if err != nil {
+		// TODO: Handle error.
+	}
+
+	// Create a new subscription to the previously created topic
+	// with the given name.
+	sub, err := client.CreateSubscription(ctx, "subName", pubsub.SubscriptionConfig{
+		Topic:       topic,
+		AckDeadline: 10 * time.Second,
 	})
 	if err != nil {
-		log.Fatal(err)
+		// TODO: Handle error.
 	}
-	log.Printf("Published a message with a message id: %s\n", msgIDs[0])
+
+	_ = sub // TODO: use the subscription.
 }
 
-func ExamplePull() {
-	ctx := Example_auth()
-
-	// E.g. c.CreateSub("sub1", "topic1", time.Duration(0), "")
-	msgs, err := pubsub.Pull(ctx, "sub1", 1)
+func ExampleTopic_Delete() {
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, "project-id")
 	if err != nil {
-		log.Fatal(err)
+		// TODO: Handle error.
 	}
-	log.Printf("New message arrived: %v\n", msgs[0])
-	if err := pubsub.Ack(ctx, "sub1", msgs[0].AckID); err != nil {
-		log.Fatal(err)
+
+	topic := client.Topic("topicName")
+	if err := topic.Delete(ctx); err != nil {
+		// TODO: Handle error.
 	}
-	log.Println("Acknowledged message")
 }
+
+func ExampleTopic_Exists() {
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, "project-id")
+	if err != nil {
+		// TODO: Handle error.
+	}
+
+	topic := client.Topic("topicName")
+	ok, err := topic.Exists(ctx)
+	if err != nil {
+		// TODO: Handle error.
+	}
+	if !ok {
+		// Topic doesn't exist.
+	}
+}
+
+func ExampleTopic_Publish() {
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, "project-id")
+	if err != nil {
+		// TODO: Handle error.
+	}
+
+	topic := client.Topic("topicName")
+	defer topic.Stop()
+	var results []*pubsub.PublishResult
+	r := topic.Publish(ctx, &pubsub.Message{
+		Data: []byte("hello world"),
+	})
+	results = append(results, r)
+	// Do other work ...
+	for _, r := range results {
+		id, err := r.Get(ctx)
+		if err != nil {
+			// TODO: Handle error.
+		}
+		fmt.Printf("Published a message with a message ID: %s\n", id)
+	}
+}
+
+func ExampleTopic_Subscriptions() {
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, "project-id")
+	if err != nil {
+		// TODO: Handle error.
+	}
+	topic := client.Topic("topic-name")
+	// List all subscriptions of the topic (maybe of multiple projects).
+	for subs := topic.Subscriptions(ctx); ; {
+		sub, err := subs.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			// TODO: Handle error.
+		}
+		_ = sub // TODO: use the subscription.
+	}
+}
+
+func ExampleSubscription_Delete() {
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, "project-id")
+	if err != nil {
+		// TODO: Handle error.
+	}
+
+	sub := client.Subscription("subName")
+	if err := sub.Delete(ctx); err != nil {
+		// TODO: Handle error.
+	}
+}
+
+func ExampleSubscription_Exists() {
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, "project-id")
+	if err != nil {
+		// TODO: Handle error.
+	}
+
+	sub := client.Subscription("subName")
+	ok, err := sub.Exists(ctx)
+	if err != nil {
+		// TODO: Handle error.
+	}
+	if !ok {
+		// Subscription doesn't exist.
+	}
+}
+
+func ExampleSubscription_Config() {
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, "project-id")
+	if err != nil {
+		// TODO: Handle error.
+	}
+	sub := client.Subscription("subName")
+	config, err := sub.Config(ctx)
+	if err != nil {
+		// TODO: Handle error.
+	}
+	fmt.Println(config)
+}
+
+func ExampleSubscription_Receive() {
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, "project-id")
+	if err != nil {
+		// TODO: Handle error.
+	}
+	sub := client.Subscription("subName")
+	err = sub.Receive(ctx, func(ctx context.Context, m *pubsub.Message) {
+		// TODO: Handle message.
+		// NOTE: May be called concurrently; synchronize access to shared memory.
+		m.Ack()
+	})
+	if err != context.Canceled {
+		// TODO: Handle error.
+	}
+}
+
+// This example shows how to configure keepalive so that unacknoweldged messages
+// expire quickly, allowing other subscribers to take them.
+func ExampleSubscription_Receive_maxExtension() {
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, "project-id")
+	if err != nil {
+		// TODO: Handle error.
+	}
+	sub := client.Subscription("subName")
+	// This program is expected to process and acknowledge messages in 30 seconds. If
+	// not, the Pub/Sub API will assume the message is not acknowledged.
+	sub.ReceiveSettings.MaxExtension = 30 * time.Second
+	err = sub.Receive(ctx, func(ctx context.Context, m *pubsub.Message) {
+		// TODO: Handle message.
+		m.Ack()
+	})
+	if err != context.Canceled {
+		// TODO: Handle error.
+	}
+}
+
+// This example shows how to throttle Subscription.Receive, which aims for high
+// throughput by default. By limiting the number of messages and/or bytes being
+// processed at once, you can bound your program's resource consumption.
+func ExampleSubscription_Receive_maxOutstanding() {
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, "project-id")
+	if err != nil {
+		// TODO: Handle error.
+	}
+	sub := client.Subscription("subName")
+	sub.ReceiveSettings.MaxOutstandingMessages = 5
+	sub.ReceiveSettings.MaxOutstandingBytes = 10e6
+	err = sub.Receive(ctx, func(ctx context.Context, m *pubsub.Message) {
+		// TODO: Handle message.
+		m.Ack()
+	})
+	if err != context.Canceled {
+		// TODO: Handle error.
+	}
+}
+
+func ExampleSubscription_Update() {
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, "project-id")
+	if err != nil {
+		// TODO: Handle error.
+	}
+	sub := client.Subscription("subName")
+	subConfig, err := sub.Update(ctx, pubsub.SubscriptionConfigToUpdate{
+		PushConfig: &pubsub.PushConfig{Endpoint: "https://example.com/push"},
+	})
+	if err != nil {
+		// TODO: Handle error.
+	}
+	_ = subConfig // TODO: Use SubscriptionConfig.
+}
+
+func ExampleSubscription_CreateSnapshot() {
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, "project-id")
+	if err != nil {
+		// TODO: Handle error.
+	}
+	sub := client.Subscription("subName")
+	snapConfig, err := sub.CreateSnapshot(ctx, "snapshotName")
+	if err != nil {
+		// TODO: Handle error.
+	}
+	_ = snapConfig // TODO: Use SnapshotConfig.
+}
+
+func ExampleSubscription_SeekToSnapshot() {
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, "project-id")
+	if err != nil {
+		// TODO: Handle error.
+	}
+	sub := client.Subscription("subName")
+	snap := client.Snapshot("snapshotName")
+	if err := sub.SeekToSnapshot(ctx, snap); err != nil {
+		// TODO: Handle error.
+	}
+}
+
+func ExampleSubscription_SeekToTime() {
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, "project-id")
+	if err != nil {
+		// TODO: Handle error.
+	}
+	sub := client.Subscription("subName")
+	if err := sub.SeekToTime(ctx, time.Now().Add(-time.Hour)); err != nil {
+		// TODO: Handle error.
+	}
+}
+
+func ExampleSnapshot_Delete() {
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, "project-id")
+	if err != nil {
+		// TODO: Handle error.
+	}
+
+	snap := client.Snapshot("snapshotName")
+	if err := snap.Delete(ctx); err != nil {
+		// TODO: Handle error.
+	}
+}
+
+func ExampleClient_Snapshots() {
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, "project-id")
+	if err != nil {
+		// TODO: Handle error.
+	}
+	// List all snapshots for the project.
+	iter := client.Snapshots(ctx)
+	_ = iter // TODO: iterate using Next.
+}
+
+func ExampleSnapshotConfigIterator_Next() {
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, "project-id")
+	if err != nil {
+		// TODO: Handle error.
+	}
+	// List all snapshots for the project.
+	iter := client.Snapshots(ctx)
+	for {
+		snapConfig, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			// TODO: Handle error.
+		}
+		_ = snapConfig // TODO: use the SnapshotConfig.
+	}
+}
+
+// TODO(jba): write an example for PublishResult.Ready
+// TODO(jba): write an example for Subscription.IAM
+// TODO(jba): write an example for Topic.IAM
+// TODO(jba): write an example for Topic.Stop

@@ -14,64 +14,108 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package bigtable // import "google.golang.org/cloud/bigtable"
+package bigtable // import "cloud.google.com/go/bigtable"
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
 	"time"
 
+	"cloud.google.com/go/bigtable/internal/gax"
+	btopt "cloud.google.com/go/bigtable/internal/option"
 	"github.com/golang/protobuf/proto"
 	"golang.org/x/net/context"
-	"google.golang.org/cloud"
-	btdpb "google.golang.org/cloud/bigtable/internal/data_proto"
-	btspb "google.golang.org/cloud/bigtable/internal/service_proto"
-	"google.golang.org/cloud/internal/transport"
+	"google.golang.org/api/option"
+	gtransport "google.golang.org/api/transport/grpc"
+	btpb "google.golang.org/genproto/googleapis/bigtable/v2"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 const prodAddr = "bigtable.googleapis.com:443"
 
-// Client is a client for reading and writing data to tables in a cluster.
+// Client is a client for reading and writing data to tables in an instance.
 //
 // A Client is safe to use concurrently, except for its Close method.
 type Client struct {
-	conn   *grpc.ClientConn
-	client btspb.BigtableServiceClient
-
-	project, zone, cluster string
+	conn              *grpc.ClientConn
+	client            btpb.BigtableClient
+	project, instance string
+	// App Profiles are part of the private alpha release of Cloud Bigtable replication.
+	// This feature
+	// is not currently available to most Cloud Bigtable customers. This feature
+	// might be changed in backward-incompatible ways and is not recommended for
+	// production use. It is not subject to any SLA or deprecation policy.
+	appProfile string
 }
 
-// NewClient creates a new Client for a given project, zone and cluster.
-func NewClient(ctx context.Context, project, zone, cluster string, opts ...cloud.ClientOption) (*Client, error) {
-	o := []cloud.ClientOption{
-		cloud.WithEndpoint(prodAddr),
-		cloud.WithScopes(Scope),
-		cloud.WithUserAgent(clientUserAgent),
+// ClientConfig has configurations for the client.
+type ClientConfig struct {
+	// The id of the app profile to associate with all data operations sent from this client.
+	// If unspecified, the default app profile for the instance will be used.
+	AppProfile string
+}
+
+// NewClient creates a new Client for a given project and instance.
+// The default ClientConfig will be used.
+func NewClient(ctx context.Context, project, instance string, opts ...option.ClientOption) (*Client, error) {
+	return NewClientWithConfig(ctx, project, instance, ClientConfig{}, opts...)
+}
+
+func NewClientWithConfig(ctx context.Context, project, instance string, config ClientConfig, opts ...option.ClientOption) (*Client, error) {
+	o, err := btopt.DefaultClientOptions(prodAddr, Scope, clientUserAgent)
+	if err != nil {
+		return nil, err
 	}
+	// Default to a small connection pool that can be overridden.
+	o = append(o,
+		option.WithGRPCConnectionPool(4),
+		// Set the max size to correspond to server-side limits.
+		option.WithGRPCDialOption(grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(100<<20), grpc.MaxCallRecvMsgSize(100<<20))),
+		// TODO(grpc/grpc-go#1388) using connection pool without WithBlock
+		// can cause RPCs to fail randomly. We can delete this after the issue is fixed.
+		option.WithGRPCDialOption(grpc.WithBlock()))
 	o = append(o, opts...)
-	conn, err := transport.DialGRPC(ctx, o...)
+	conn, err := gtransport.Dial(ctx, o...)
 	if err != nil {
 		return nil, fmt.Errorf("dialing: %v", err)
 	}
-	return &Client{
-		conn:   conn,
-		client: btspb.NewBigtableServiceClient(conn),
 
-		project: project,
-		zone:    zone,
-		cluster: cluster,
+	return &Client{
+		conn:       conn,
+		client:     btpb.NewBigtableClient(conn),
+		project:    project,
+		instance:   instance,
+		appProfile: config.AppProfile,
 	}, nil
 }
 
 // Close closes the Client.
-func (c *Client) Close() {
-	c.conn.Close()
+func (c *Client) Close() error {
+	return c.conn.Close()
+}
+
+var (
+	idempotentRetryCodes  = []codes.Code{codes.DeadlineExceeded, codes.Unavailable, codes.Aborted}
+	isIdempotentRetryCode = make(map[codes.Code]bool)
+	retryOptions          = []gax.CallOption{
+		gax.WithDelayTimeoutSettings(100*time.Millisecond, 2000*time.Millisecond, 1.2),
+		gax.WithRetryCodes(idempotentRetryCodes),
+	}
+)
+
+func init() {
+	for _, code := range idempotentRetryCodes {
+		isIdempotentRetryCode[code] = true
+	}
 }
 
 func (c *Client) fullTableName(table string) string {
-	return fmt.Sprintf("projects/%s/zones/%s/clusters/%s/tables/%s", c.project, c.zone, c.cluster, table)
+	return fmt.Sprintf("projects/%s/instances/%s/tables/%s", c.project, c.instance, table)
 }
 
 // A Table refers to a table.
@@ -80,6 +124,9 @@ func (c *Client) fullTableName(table string) string {
 type Table struct {
 	c     *Client
 	table string
+
+	// Metadata to be sent with each request.
+	md metadata.MD
 }
 
 // Open opens a table.
@@ -87,6 +134,7 @@ func (c *Client) Open(table string) *Table {
 	return &Table{
 		c:     c,
 		table: table,
+		md:    metadata.Pairs(resourcePrefixHeader, c.fullTableName(table)),
 	}
 }
 
@@ -94,48 +142,88 @@ func (c *Client) Open(table string) *Table {
 
 // ReadRows reads rows from a table. f is called for each row.
 // If f returns false, the stream is shut down and ReadRows returns.
-// f owns its argument, and f is called serially.
+// f owns its argument, and f is called serially in order by row key.
 //
 // By default, the yielded rows will contain all values in all cells.
 // Use RowFilter to limit the cells returned.
-func (t *Table) ReadRows(ctx context.Context, arg RowRange, f func(Row) bool, opts ...ReadOption) error {
-	req := &btspb.ReadRowsRequest{
-		TableName: t.c.fullTableName(t.table),
-		Target:    &btspb.ReadRowsRequest_RowRange{arg.proto()},
-	}
-	for _, opt := range opts {
-		opt.set(req)
-	}
-	ctx, cancel := context.WithCancel(ctx) // for aborting the stream
-	defer cancel()
-	stream, err := t.c.client.ReadRows(ctx, req)
-	if err != nil {
-		return err
-	}
-	cr := new(chunkReader)
-	for {
-		res, err := stream.Recv()
-		if err == io.EOF {
-			break
+func (t *Table) ReadRows(ctx context.Context, arg RowSet, f func(Row) bool, opts ...ReadOption) error {
+	ctx = mergeOutgoingMetadata(ctx, t.md)
+
+	var prevRowKey string
+	var err error
+	ctx = traceStartSpan(ctx, "cloud.google.com/go/bigtable.ReadRows")
+	defer func() { traceEndSpan(ctx, err) }()
+	attrMap := make(map[string]interface{})
+	err = gax.Invoke(ctx, func(ctx context.Context) error {
+		if !arg.valid() {
+			// Empty row set, no need to make an API call.
+			// NOTE: we must return early if arg == RowList{} because reading
+			// an empty RowList from bigtable returns all rows from that table.
+			return nil
 		}
+		req := &btpb.ReadRowsRequest{
+			TableName:    t.c.fullTableName(t.table),
+			AppProfileId: t.c.appProfile,
+			Rows:         arg.proto(),
+		}
+		for _, opt := range opts {
+			opt.set(req)
+		}
+		ctx, cancel := context.WithCancel(ctx) // for aborting the stream
+		defer cancel()
+
+		startTime := time.Now()
+		stream, err := t.c.client.ReadRows(ctx, req)
 		if err != nil {
 			return err
 		}
-		if row := cr.process(res); row != nil {
-			if !f(row) {
-				// Cancel and drain stream.
-				cancel()
-				for {
-					if _, err := stream.Recv(); err != nil {
-						// The stream has ended. We don't return an error
-						// because the caller has intentionally interrupted the scan.
-						return nil
+		cr := newChunkReader()
+		for {
+			res, err := stream.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				// Reset arg for next Invoke call.
+				arg = arg.retainRowsAfter(prevRowKey)
+				attrMap["rowKey"] = prevRowKey
+				attrMap["error"] = err.Error()
+				attrMap["time_secs"] = time.Since(startTime).Seconds()
+				tracePrintf(ctx, attrMap, "Retry details in ReadRows")
+				return err
+			}
+
+			for _, cc := range res.Chunks {
+				row, err := cr.Process(cc)
+				if err != nil {
+					// No need to prepare for a retry, this is an unretryable error.
+					return err
+				}
+				if row == nil {
+					continue
+				}
+				prevRowKey = row.Key()
+				if !f(row) {
+					// Cancel and drain stream.
+					cancel()
+					for {
+						if _, err := stream.Recv(); err != nil {
+							// The stream has ended. We don't return an error
+							// because the caller has intentionally interrupted the scan.
+							return nil
+						}
 					}
 				}
 			}
+			if err := cr.Close(); err != nil {
+				// No need to prepare for a retry, this is an unretryable error.
+				return err
+			}
 		}
-	}
-	return nil
+		return err
+	}, retryOptions...)
+
+	return err
 }
 
 // ReadRow is a convenience implementation of a single-row reader.
@@ -149,50 +237,14 @@ func (t *Table) ReadRow(ctx context.Context, row string, opts ...ReadOption) (Ro
 	return r, err
 }
 
-type chunkReader struct {
-	partial map[string]Row // incomplete rows
-}
-
-// process handles a single btspb.ReadRowsResponse.
-// If it completes a row, that row is returned.
-func (cr *chunkReader) process(rrr *btspb.ReadRowsResponse) Row {
-	if cr.partial == nil {
-		cr.partial = make(map[string]Row)
-	}
-	row := string(rrr.RowKey)
-	r := cr.partial[row]
-	if r == nil {
-		r = make(Row)
-		cr.partial[row] = r
-	}
-	for _, chunk := range rrr.Chunks {
-		switch c := chunk.Chunk.(type) {
-		case *btspb.ReadRowsResponse_Chunk_ResetRow:
-			r = make(Row)
-			cr.partial[row] = r
-			continue
-		case *btspb.ReadRowsResponse_Chunk_CommitRow:
-			delete(cr.partial, row)
-			if len(r) == 0 {
-				// Treat zero-content commits as absent.
-				continue
-			}
-			return r // assume that this is the last chunk
-		case *btspb.ReadRowsResponse_Chunk_RowContents:
-			decodeFamilyProto(r, row, c.RowContents)
-		}
-	}
-	return nil
-}
-
 // decodeFamilyProto adds the cell data from f to the given row.
-func decodeFamilyProto(r Row, row string, f *btdpb.Family) {
+func decodeFamilyProto(r Row, row string, f *btpb.Family) {
 	fam := f.Name // does not have colon
 	for _, col := range f.Columns {
 		for _, cell := range col.Cells {
 			ri := ReadItem{
 				Row:       row,
-				Column:    fmt.Sprintf("%s:%s", fam, col.Qualifier),
+				Column:    fam + ":" + string(col.Qualifier),
 				Timestamp: Timestamp(cell.TimestampMicros),
 				Value:     cell.Value,
 			}
@@ -201,7 +253,44 @@ func decodeFamilyProto(r Row, row string, f *btdpb.Family) {
 	}
 }
 
-// A RowRange is used to describe the rows to be read.
+// RowSet is a set of rows to be read. It is satisfied by RowList, RowRange and RowRangeList.
+// The serialized size of the RowSet must be no larger than 1MiB.
+type RowSet interface {
+	proto() *btpb.RowSet
+
+	// retainRowsAfter returns a new RowSet that does not include the
+	// given row key or any row key lexicographically less than it.
+	retainRowsAfter(lastRowKey string) RowSet
+
+	// Valid reports whether this set can cover at least one row.
+	valid() bool
+}
+
+// RowList is a sequence of row keys.
+type RowList []string
+
+func (r RowList) proto() *btpb.RowSet {
+	keys := make([][]byte, len(r))
+	for i, row := range r {
+		keys[i] = []byte(row)
+	}
+	return &btpb.RowSet{RowKeys: keys}
+}
+
+func (r RowList) retainRowsAfter(lastRowKey string) RowSet {
+	var retryKeys RowList
+	for _, key := range r {
+		if key > lastRowKey {
+			retryKeys = append(retryKeys, key)
+		}
+	}
+	return retryKeys
+}
+
+func (r RowList) valid() bool {
+	return len(r) > 0
+}
+
 // A RowRange is a half-open interval [Start, Limit) encompassing
 // all the rows with keys at least as large as Start, and less than Limit.
 // (Bigtable string comparison is the same as Go's.)
@@ -238,22 +327,71 @@ func (r RowRange) String() string {
 	return fmt.Sprintf("[%s,%q)", a, r.limit)
 }
 
-func (r RowRange) proto() *btdpb.RowRange {
-	if r.Unbounded() {
-		return &btdpb.RowRange{StartKey: []byte(r.start)}
+func (r RowRange) proto() *btpb.RowSet {
+	rr := &btpb.RowRange{
+		StartKey: &btpb.RowRange_StartKeyClosed{StartKeyClosed: []byte(r.start)},
 	}
-	return &btdpb.RowRange{
-		StartKey: []byte(r.start),
-		EndKey:   []byte(r.limit),
+	if !r.Unbounded() {
+		rr.EndKey = &btpb.RowRange_EndKeyOpen{EndKeyOpen: []byte(r.limit)}
 	}
+	return &btpb.RowSet{RowRanges: []*btpb.RowRange{rr}}
 }
 
-// SingleRow returns a RowRange for reading a single row.
-func SingleRow(row string) RowRange {
-	return RowRange{
-		start: row,
-		limit: row + "\x00",
+func (r RowRange) retainRowsAfter(lastRowKey string) RowSet {
+	if lastRowKey == "" || lastRowKey < r.start {
+		return r
 	}
+	// Set the beginning of the range to the row after the last scanned.
+	start := lastRowKey + "\x00"
+	if r.Unbounded() {
+		return InfiniteRange(start)
+	}
+	return NewRange(start, r.limit)
+}
+
+func (r RowRange) valid() bool {
+	return r.Unbounded() || r.start < r.limit
+}
+
+// RowRangeList is a sequence of RowRanges representing the union of the ranges.
+type RowRangeList []RowRange
+
+func (r RowRangeList) proto() *btpb.RowSet {
+	ranges := make([]*btpb.RowRange, len(r))
+	for i, rr := range r {
+		// RowRange.proto() returns a RowSet with a single element RowRange array
+		ranges[i] = rr.proto().RowRanges[0]
+	}
+	return &btpb.RowSet{RowRanges: ranges}
+}
+
+func (r RowRangeList) retainRowsAfter(lastRowKey string) RowSet {
+	if lastRowKey == "" {
+		return r
+	}
+	// Return a list of any range that has not yet been completely processed
+	var ranges RowRangeList
+	for _, rr := range r {
+		retained := rr.retainRowsAfter(lastRowKey)
+		if retained.valid() {
+			ranges = append(ranges, retained.(RowRange))
+		}
+	}
+	return ranges
+}
+
+func (r RowRangeList) valid() bool {
+	for _, rr := range r {
+		if rr.valid() {
+			return true
+		}
+	}
+	return false
+}
+
+// SingleRow returns a RowSet for reading a single row.
+func SingleRow(row string) RowSet {
+	return RowList{row}
 }
 
 // PrefixRange returns a RowRange consisting of all keys starting with the prefix.
@@ -293,79 +431,104 @@ func prefixSuccessor(prefix string) string {
 
 // A ReadOption is an optional argument to ReadRows.
 type ReadOption interface {
-	set(req *btspb.ReadRowsRequest)
+	set(req *btpb.ReadRowsRequest)
 }
 
 // RowFilter returns a ReadOption that applies f to the contents of read rows.
+//
+// If multiple RowFilters are provided, only the last is used. To combine filters,
+// use ChainFilters or InterleaveFilters instead.
 func RowFilter(f Filter) ReadOption { return rowFilter{f} }
 
 type rowFilter struct{ f Filter }
 
-func (rf rowFilter) set(req *btspb.ReadRowsRequest) { req.Filter = rf.f.proto() }
+func (rf rowFilter) set(req *btpb.ReadRowsRequest) { req.Filter = rf.f.proto() }
 
 // LimitRows returns a ReadOption that will limit the number of rows to be read.
 func LimitRows(limit int64) ReadOption { return limitRows{limit} }
 
 type limitRows struct{ limit int64 }
 
-func (lr limitRows) set(req *btspb.ReadRowsRequest) { req.NumRowsLimit = lr.limit }
+func (lr limitRows) set(req *btpb.ReadRowsRequest) { req.RowsLimit = lr.limit }
 
-// A Row is returned by ReadRow. The map is keyed by column family (the prefix
-// of the column name before the colon). The values are the returned ReadItems
-// for that column family in the order returned by Read.
-type Row map[string][]ReadItem
-
-// Key returns the row's key, or "" if the row is empty.
-func (r Row) Key() string {
-	for _, items := range r {
-		if len(items) > 0 {
-			return items[0].Row
+// mutationsAreRetryable returns true if all mutations are idempotent
+// and therefore retryable. A mutation is idempotent iff all cell timestamps
+// have an explicit timestamp set and do not rely on the timestamp being set on the server.
+func mutationsAreRetryable(muts []*btpb.Mutation) bool {
+	serverTime := int64(ServerTime)
+	for _, mut := range muts {
+		setCell := mut.GetSetCell()
+		if setCell != nil && setCell.TimestampMicros == serverTime {
+			return false
 		}
 	}
-	return ""
-}
-
-// A ReadItem is returned by Read. A ReadItem contains data from a specific row and column.
-type ReadItem struct {
-	Row, Column string
-	Timestamp   Timestamp
-	Value       []byte
+	return true
 }
 
 // Apply applies a Mutation to a specific row.
 func (t *Table) Apply(ctx context.Context, row string, m *Mutation, opts ...ApplyOption) error {
+	ctx = mergeOutgoingMetadata(ctx, t.md)
 	after := func(res proto.Message) {
 		for _, o := range opts {
 			o.after(res)
 		}
 	}
 
+	var err error
+	ctx = traceStartSpan(ctx, "cloud.google.com/go/bigtable/Apply")
+	defer func() { traceEndSpan(ctx, err) }()
+	var callOptions []gax.CallOption
 	if m.cond == nil {
-		req := &btspb.MutateRowRequest{
-			TableName: t.c.fullTableName(t.table),
-			RowKey:    []byte(row),
-			Mutations: m.ops,
+		req := &btpb.MutateRowRequest{
+			TableName:    t.c.fullTableName(t.table),
+			AppProfileId: t.c.appProfile,
+			RowKey:       []byte(row),
+			Mutations:    m.ops,
 		}
-		res, err := t.c.client.MutateRow(ctx, req)
+		if mutationsAreRetryable(m.ops) {
+			callOptions = retryOptions
+		}
+		var res *btpb.MutateRowResponse
+		err := gax.Invoke(ctx, func(ctx context.Context) error {
+			var err error
+			res, err = t.c.client.MutateRow(ctx, req)
+			return err
+		}, callOptions...)
 		if err == nil {
 			after(res)
 		}
 		return err
 	}
-	req := &btspb.CheckAndMutateRowRequest{
+
+	req := &btpb.CheckAndMutateRowRequest{
 		TableName:       t.c.fullTableName(t.table),
+		AppProfileId:    t.c.appProfile,
 		RowKey:          []byte(row),
 		PredicateFilter: m.cond.proto(),
 	}
 	if m.mtrue != nil {
+		if m.mtrue.cond != nil {
+			return errors.New("bigtable: conditional mutations cannot be nested")
+		}
 		req.TrueMutations = m.mtrue.ops
 	}
 	if m.mfalse != nil {
+		if m.mfalse.cond != nil {
+			return errors.New("bigtable: conditional mutations cannot be nested")
+		}
 		req.FalseMutations = m.mfalse.ops
 	}
-	res, err := t.c.client.CheckAndMutateRow(ctx, req)
+	if mutationsAreRetryable(req.TrueMutations) && mutationsAreRetryable(req.FalseMutations) {
+		callOptions = retryOptions
+	}
+	var cmRes *btpb.CheckAndMutateRowResponse
+	err = gax.Invoke(ctx, func(ctx context.Context) error {
+		var err error
+		cmRes, err = t.c.client.CheckAndMutateRow(ctx, req)
+		return err
+	}, callOptions...)
 	if err == nil {
-		after(res)
+		after(cmRes)
 	}
 	return err
 }
@@ -383,7 +546,7 @@ func (a applyAfterFunc) after(res proto.Message) { a(res) }
 // mutation's condition matched.
 func GetCondMutationResult(matched *bool) ApplyOption {
 	return applyAfterFunc(func(res proto.Message) {
-		if res, ok := res.(*btspb.CheckAndMutateRowResponse); ok {
+		if res, ok := res.(*btpb.CheckAndMutateRowResponse); ok {
 			*matched = res.PredicateMatched
 		}
 	})
@@ -391,7 +554,7 @@ func GetCondMutationResult(matched *bool) ApplyOption {
 
 // Mutation represents a set of changes for a single row of a table.
 type Mutation struct {
-	ops []*btdpb.Mutation
+	ops []*btpb.Mutation
 
 	// for conditional mutations
 	cond          Filter
@@ -413,25 +576,20 @@ func NewCondMutation(cond Filter, mtrue, mfalse *Mutation) *Mutation {
 }
 
 // Set sets a value in a specified column, with the given timestamp.
-// The timestamp will be truncated to millisecond resolution.
+// The timestamp will be truncated to millisecond granularity.
 // A timestamp of ServerTime means to use the server timestamp.
 func (m *Mutation) Set(family, column string, ts Timestamp, value []byte) {
-	if ts != ServerTime {
-		// Truncate to millisecond resolution, since that's the default table config.
-		// TODO(dsymonds): Provide a way to override this behaviour.
-		ts -= ts % 1000
-	}
-	m.ops = append(m.ops, &btdpb.Mutation{Mutation: &btdpb.Mutation_SetCell_{&btdpb.Mutation_SetCell{
+	m.ops = append(m.ops, &btpb.Mutation{Mutation: &btpb.Mutation_SetCell_{SetCell: &btpb.Mutation_SetCell{
 		FamilyName:      family,
 		ColumnQualifier: []byte(column),
-		TimestampMicros: int64(ts),
+		TimestampMicros: int64(ts.TruncateToMilliseconds()),
 		Value:           value,
 	}}})
 }
 
 // DeleteCellsInColumn will delete all the cells whose columns are family:column.
 func (m *Mutation) DeleteCellsInColumn(family, column string) {
-	m.ops = append(m.ops, &btdpb.Mutation{Mutation: &btdpb.Mutation_DeleteFromColumn_{&btdpb.Mutation_DeleteFromColumn{
+	m.ops = append(m.ops, &btpb.Mutation{Mutation: &btpb.Mutation_DeleteFromColumn_{DeleteFromColumn: &btpb.Mutation_DeleteFromColumn{
 		FamilyName:      family,
 		ColumnQualifier: []byte(column),
 	}}})
@@ -440,27 +598,159 @@ func (m *Mutation) DeleteCellsInColumn(family, column string) {
 // DeleteTimestampRange deletes all cells whose columns are family:column
 // and whose timestamps are in the half-open interval [start, end).
 // If end is zero, it will be interpreted as infinity.
+// The timestamps will be truncated to millisecond granularity.
 func (m *Mutation) DeleteTimestampRange(family, column string, start, end Timestamp) {
-	m.ops = append(m.ops, &btdpb.Mutation{Mutation: &btdpb.Mutation_DeleteFromColumn_{&btdpb.Mutation_DeleteFromColumn{
+	m.ops = append(m.ops, &btpb.Mutation{Mutation: &btpb.Mutation_DeleteFromColumn_{DeleteFromColumn: &btpb.Mutation_DeleteFromColumn{
 		FamilyName:      family,
 		ColumnQualifier: []byte(column),
-		TimeRange: &btdpb.TimestampRange{
-			StartTimestampMicros: int64(start),
-			EndTimestampMicros:   int64(end),
+		TimeRange: &btpb.TimestampRange{
+			StartTimestampMicros: int64(start.TruncateToMilliseconds()),
+			EndTimestampMicros:   int64(end.TruncateToMilliseconds()),
 		},
 	}}})
 }
 
 // DeleteCellsInFamily will delete all the cells whose columns are family:*.
 func (m *Mutation) DeleteCellsInFamily(family string) {
-	m.ops = append(m.ops, &btdpb.Mutation{Mutation: &btdpb.Mutation_DeleteFromFamily_{&btdpb.Mutation_DeleteFromFamily{
+	m.ops = append(m.ops, &btpb.Mutation{Mutation: &btpb.Mutation_DeleteFromFamily_{DeleteFromFamily: &btpb.Mutation_DeleteFromFamily{
 		FamilyName: family,
 	}}})
 }
 
 // DeleteRow deletes the entire row.
 func (m *Mutation) DeleteRow() {
-	m.ops = append(m.ops, &btdpb.Mutation{Mutation: &btdpb.Mutation_DeleteFromRow_{&btdpb.Mutation_DeleteFromRow{}}})
+	m.ops = append(m.ops, &btpb.Mutation{Mutation: &btpb.Mutation_DeleteFromRow_{DeleteFromRow: &btpb.Mutation_DeleteFromRow{}}})
+}
+
+// entryErr is a container that combines an entry with the error that was returned for it.
+// Err may be nil if no error was returned for the Entry, or if the Entry has not yet been processed.
+type entryErr struct {
+	Entry *btpb.MutateRowsRequest_Entry
+	Err   error
+}
+
+// ApplyBulk applies multiple Mutations, up to a maximum of 100,000.
+// Each mutation is individually applied atomically,
+// but the set of mutations may be applied in any order.
+//
+// Two types of failures may occur. If the entire process
+// fails, (nil, err) will be returned. If specific mutations
+// fail to apply, ([]err, nil) will be returned, and the errors
+// will correspond to the relevant rowKeys/muts arguments.
+//
+// Conditional mutations cannot be applied in bulk and providing one will result in an error.
+func (t *Table) ApplyBulk(ctx context.Context, rowKeys []string, muts []*Mutation, opts ...ApplyOption) ([]error, error) {
+	ctx = mergeOutgoingMetadata(ctx, t.md)
+	if len(rowKeys) != len(muts) {
+		return nil, fmt.Errorf("mismatched rowKeys and mutation array lengths: %d, %d", len(rowKeys), len(muts))
+	}
+
+	origEntries := make([]*entryErr, len(rowKeys))
+	for i, key := range rowKeys {
+		mut := muts[i]
+		if mut.cond != nil {
+			return nil, errors.New("conditional mutations cannot be applied in bulk")
+		}
+		origEntries[i] = &entryErr{Entry: &btpb.MutateRowsRequest_Entry{RowKey: []byte(key), Mutations: mut.ops}}
+	}
+
+	// entries will be reduced after each invocation to just what needs to be retried.
+	entries := make([]*entryErr, len(rowKeys))
+	copy(entries, origEntries)
+	var err error
+	ctx = traceStartSpan(ctx, "cloud.google.com/go/bigtable/ApplyBulk")
+	defer func() { traceEndSpan(ctx, err) }()
+	attrMap := make(map[string]interface{})
+	err = gax.Invoke(ctx, func(ctx context.Context) error {
+		attrMap["rowCount"] = len(entries)
+		tracePrintf(ctx, attrMap, "Row count in ApplyBulk")
+		err := t.doApplyBulk(ctx, entries, opts...)
+		if err != nil {
+			// We want to retry the entire request with the current entries
+			return err
+		}
+		entries = t.getApplyBulkRetries(entries)
+		if len(entries) > 0 && len(idempotentRetryCodes) > 0 {
+			// We have at least one mutation that needs to be retried.
+			// Return an arbitrary error that is retryable according to callOptions.
+			return status.Errorf(idempotentRetryCodes[0], "Synthetic error: partial failure of ApplyBulk")
+		}
+		return nil
+	}, retryOptions...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Accumulate all of the errors into an array to return, interspersed with nils for successful
+	// entries. The absence of any errors means we should return nil.
+	var errs []error
+	var foundErr bool
+	for _, entry := range origEntries {
+		if entry.Err != nil {
+			foundErr = true
+		}
+		errs = append(errs, entry.Err)
+	}
+	if foundErr {
+		return errs, nil
+	}
+	return nil, nil
+}
+
+// getApplyBulkRetries returns the entries that need to be retried
+func (t *Table) getApplyBulkRetries(entries []*entryErr) []*entryErr {
+	var retryEntries []*entryErr
+	for _, entry := range entries {
+		err := entry.Err
+		if err != nil && isIdempotentRetryCode[grpc.Code(err)] && mutationsAreRetryable(entry.Entry.Mutations) {
+			// There was an error and the entry is retryable.
+			retryEntries = append(retryEntries, entry)
+		}
+	}
+	return retryEntries
+}
+
+// doApplyBulk does the work of a single ApplyBulk invocation
+func (t *Table) doApplyBulk(ctx context.Context, entryErrs []*entryErr, opts ...ApplyOption) error {
+	after := func(res proto.Message) {
+		for _, o := range opts {
+			o.after(res)
+		}
+	}
+
+	entries := make([]*btpb.MutateRowsRequest_Entry, len(entryErrs))
+	for i, entryErr := range entryErrs {
+		entries[i] = entryErr.Entry
+	}
+	req := &btpb.MutateRowsRequest{
+		TableName:    t.c.fullTableName(t.table),
+		AppProfileId: t.c.appProfile,
+		Entries:      entries,
+	}
+	stream, err := t.c.client.MutateRows(ctx, req)
+	if err != nil {
+		return err
+	}
+	for {
+		res, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+
+		for i, entry := range res.Entries {
+			s := entry.Status
+			if s.Code == int32(codes.OK) {
+				entryErrs[i].Err = nil
+			} else {
+				entryErrs[i].Err = status.Errorf(codes.Code(s.Code), s.Message)
+			}
+		}
+		after(res)
+	}
+	return nil
 }
 
 // Timestamp is in units of microseconds since 1 January 1970.
@@ -479,20 +769,34 @@ func Now() Timestamp { return Time(time.Now()) }
 // Time converts a Timestamp into a time.Time.
 func (ts Timestamp) Time() time.Time { return time.Unix(0, int64(ts)*1e3) }
 
+// TruncateToMilliseconds truncates a Timestamp to millisecond granularity,
+// which is currently the only granularity supported.
+func (ts Timestamp) TruncateToMilliseconds() Timestamp {
+	if ts == ServerTime {
+		return ts
+	}
+	return ts - ts%1000
+}
+
 // ApplyReadModifyWrite applies a ReadModifyWrite to a specific row.
 // It returns the newly written cells.
 func (t *Table) ApplyReadModifyWrite(ctx context.Context, row string, m *ReadModifyWrite) (Row, error) {
-	req := &btspb.ReadModifyWriteRowRequest{
-		TableName: t.c.fullTableName(t.table),
-		RowKey:    []byte(row),
-		Rules:     m.ops,
+	ctx = mergeOutgoingMetadata(ctx, t.md)
+	req := &btpb.ReadModifyWriteRowRequest{
+		TableName:    t.c.fullTableName(t.table),
+		AppProfileId: t.c.appProfile,
+		RowKey:       []byte(row),
+		Rules:        m.ops,
 	}
 	res, err := t.c.client.ReadModifyWriteRow(ctx, req)
 	if err != nil {
 		return nil, err
 	}
+	if res.Row == nil {
+		return nil, errors.New("unable to apply ReadModifyWrite: res.Row=nil")
+	}
 	r := make(Row)
-	for _, fam := range res.Families { // res is *btdpb.Row, fam is *btdpb.Family
+	for _, fam := range res.Row.Families { // res is *btpb.Row, fam is *btpb.Family
 		decodeFamilyProto(r, row, fam)
 	}
 	return r, nil
@@ -507,7 +811,7 @@ func (t *Table) ApplyReadModifyWrite(ctx context.Context, row string, m *ReadMod
 // The application of a ReadModifyWrite is atomic; concurrent ReadModifyWrites will
 // be executed serially by the server.
 type ReadModifyWrite struct {
-	ops []*btdpb.ReadModifyWriteRule
+	ops []*btpb.ReadModifyWriteRule
 }
 
 // NewReadModifyWrite returns a new ReadModifyWrite.
@@ -516,10 +820,10 @@ func NewReadModifyWrite() *ReadModifyWrite { return new(ReadModifyWrite) }
 // AppendValue appends a value to a specific cell's value.
 // If the cell is unset, it will be treated as an empty value.
 func (m *ReadModifyWrite) AppendValue(family, column string, v []byte) {
-	m.ops = append(m.ops, &btdpb.ReadModifyWriteRule{
+	m.ops = append(m.ops, &btpb.ReadModifyWriteRule{
 		FamilyName:      family,
 		ColumnQualifier: []byte(column),
-		Rule:            &btdpb.ReadModifyWriteRule_AppendValue{v},
+		Rule:            &btpb.ReadModifyWriteRule_AppendValue{AppendValue: v},
 	})
 }
 
@@ -528,9 +832,53 @@ func (m *ReadModifyWrite) AppendValue(family, column string, v []byte) {
 // If the cell is set and is not an 8-byte value, the entire ApplyReadModifyWrite
 // operation will fail.
 func (m *ReadModifyWrite) Increment(family, column string, delta int64) {
-	m.ops = append(m.ops, &btdpb.ReadModifyWriteRule{
+	m.ops = append(m.ops, &btpb.ReadModifyWriteRule{
 		FamilyName:      family,
 		ColumnQualifier: []byte(column),
-		Rule:            &btdpb.ReadModifyWriteRule_IncrementAmount{delta},
+		Rule:            &btpb.ReadModifyWriteRule_IncrementAmount{IncrementAmount: delta},
 	})
+}
+
+// mergeOutgoingMetadata returns a context populated by the existing outgoing metadata,
+// if any, joined with internal metadata.
+func mergeOutgoingMetadata(ctx context.Context, md metadata.MD) context.Context {
+	mdCopy, _ := metadata.FromOutgoingContext(ctx)
+	return metadata.NewOutgoingContext(ctx, metadata.Join(mdCopy, md))
+}
+
+func (t *Table) SampleRowKeys(ctx context.Context) ([]string, error) {
+	ctx = mergeOutgoingMetadata(ctx, t.md)
+	var sampledRowKeys []string
+	err := gax.Invoke(ctx, func(ctx context.Context) error {
+		sampledRowKeys = nil
+		req := &btpb.SampleRowKeysRequest{
+			TableName:    t.c.fullTableName(t.table),
+			AppProfileId: t.c.appProfile,
+		}
+		ctx, cancel := context.WithCancel(ctx) // for aborting the stream
+		defer cancel()
+
+		stream, err := t.c.client.SampleRowKeys(ctx, req)
+		if err != nil {
+			return err
+		}
+		for {
+			res, err := stream.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return err
+			}
+
+			key := string(res.RowKey)
+			if key == "" {
+				continue
+			}
+
+			sampledRowKeys = append(sampledRowKeys, key)
+		}
+		return nil
+	}, retryOptions...)
+	return sampledRowKeys, err
 }

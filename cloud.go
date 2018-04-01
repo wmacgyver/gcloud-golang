@@ -12,45 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package cloud contains Google Cloud Platform APIs related types
-// and common functions.
-package cloud // import "google.golang.org/cloud"
+/*
+Package cloud is the root of the packages used to access Google Cloud
+Services. See https://godoc.org/cloud.google.com/go for a full list
+of sub-packages.
 
-import (
-	"net/http"
+Examples in this package show ways to authorize and authenticate the
+sub packages.
 
-	"golang.org/x/net/context"
-	"google.golang.org/cloud/internal"
-)
+Connection Pooling
 
-// NewContext returns a new context that uses the provided http.Client.
-// Provided http.Client is responsible to authorize and authenticate
-// the requests made to the Google Cloud APIs.
-// It mutates the client's original Transport to append the cloud
-// package's user-agent to the outgoing requests.
-// You can obtain the project ID from the Google Developers Console,
-// https://console.developers.google.com.
-func NewContext(projID string, c *http.Client) context.Context {
-	if c == nil {
-		panic("invalid nil *http.Client passed to NewContext")
-	}
-	return WithContext(context.Background(), projID, c)
-}
+Connection pooling differs in clients based on their transport. Cloud
+clients either rely on HTTP or gRPC transports to communicate
+with Google Cloud.
 
-// WithContext returns a new context in a similar way NewContext does,
-// but initiates the new context with the specified parent.
-func WithContext(parent context.Context, projID string, c *http.Client) context.Context {
-	// TODO(bradfitz): delete internal.Transport. It's too wrappy for what it does.
-	// Do User-Agent some other way.
-	if c == nil {
-		panic("invalid nil *http.Client passed to WithContext")
-	}
-	if _, ok := c.Transport.(*internal.Transport); !ok {
-		base := c.Transport
-		if base == nil {
-			base = http.DefaultTransport
-		}
-		c.Transport = &internal.Transport{Base: base}
-	}
-	return internal.WithContext(parent, projID, c)
-}
+Cloud clients that use HTTP (bigquery, compute, storage, and translate) rely on the
+underlying HTTP transport to cache connections for later re-use. These are cached to
+the default http.MaxIdleConns and http.MaxIdleConnsPerHost settings in
+http.DefaultTransport.
+
+For gPRC clients (all others in this repo), connection pooling is configurable. Users
+of cloud client libraries may specify option.WithGRPCConnectionPool(n) as a client
+option to NewClient calls. This configures the underlying gRPC connections to be
+pooled and addressed in a round robin fashion.
+
+*/
+package cloud // import "cloud.google.com/go"
